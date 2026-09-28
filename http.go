@@ -51,6 +51,20 @@ func (h *Handler) routes() {
 
 	m.HandleFunc("GET /outbox", h.listOutbox)
 	m.HandleFunc("POST /outbox/{id}/dispatch", h.dispatchOutbox)
+
+	// 跨环境逐级晋级
+	m.HandleFunc("PUT /promotion-policy", h.putPromotionPolicy)
+	m.HandleFunc("GET /promotion-policy", h.getPromotionPolicy)
+	m.HandleFunc("POST /promotions", h.createPromotion)
+	m.HandleFunc("GET /promotions", h.listPromotions)
+	m.HandleFunc("GET /promotions/{pid}", h.getPromotion)
+	m.HandleFunc("POST /promotions/{pid}/cancel", h.cancelPromotion)
+	m.HandleFunc("POST /promotions/{pid}/retry", h.retryPromotion)
+	m.HandleFunc("POST /promotions/{pid}/environments/{env}/approve", h.approveEnv)
+	m.HandleFunc("POST /promotions/{pid}/environments/{env}/deploy/claim", h.claimDeploy)
+	m.HandleFunc("POST /promotions/{pid}/environments/{env}/deploy/report", h.reportDeploy)
+	m.HandleFunc("POST /promotions/{pid}/environments/{env}/rollback/claim", h.claimRollback)
+	m.HandleFunc("POST /promotions/{pid}/environments/{env}/rollback/report", h.reportRollback)
 }
 
 // ---- 请求/响应 DTO ----
@@ -430,6 +444,8 @@ func statusFor(err error) (int, string) {
 		return http.StatusConflict, "idempotency_conflict"
 	case errors.Is(err, ErrStateConflict):
 		return http.StatusConflict, "state_conflict"
+	case errors.Is(err, ErrLease):
+		return http.StatusConflict, "lease_conflict"
 	default:
 		return http.StatusInternalServerError, "internal"
 	}

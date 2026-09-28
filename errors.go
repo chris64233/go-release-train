@@ -10,6 +10,7 @@ import "errors"
 //   - ErrStateConflict     状态机冲突（如冻结后再编辑、已放行后取消）
 //   - ErrVersionConflict   乐观版本条件不匹配（expectedVersion 过期）
 //   - ErrIdempotencyConflict 同一幂等键携带了不同的请求内容，或不可变版本被改写
+//   - ErrLease            部署/回退回执不属于当前租约（旧尝试的迟到回执、已被接管）
 var (
 	ErrInvalidArgument     = errors.New("invalid argument")
 	ErrNotFound            = errors.New("not found")
@@ -18,6 +19,7 @@ var (
 	ErrStateConflict       = errors.New("state conflict")
 	ErrVersionConflict     = errors.New("version conflict")
 	ErrIdempotencyConflict = errors.New("idempotency conflict")
+	ErrLease               = errors.New("lease conflict")
 )
 
 // DependencyError 携带冻结校验时发现的全部问题。

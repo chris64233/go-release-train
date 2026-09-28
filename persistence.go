@@ -23,17 +23,23 @@ type storedState struct {
 	// versions: component -> "major.minor.patch" -> 已登记版本（不可变）
 	versions map[string]map[string]ComponentVersion
 	trains   map[string]*Train
-	outbox   []OutboxEvent
-	idem     map[string]idemRecord
+	// promotions 是跨环境晋级执行；只引用已冻结/放行列车的快照副本，
+	// 与列车后续状态解耦。
+	promotions map[string]*Promotion
+	outbox     []OutboxEvent
+	idem       map[string]idemRecord
 	// policy 是当前（可变）的审批策略；冻结时复制进列车成为策略快照。
 	policy *PolicySnapshot
+	// promotionPolicy 是当前（可变）的跨环境晋级策略；创建晋级时复制冻结。
+	promotionPolicy *PromotionPolicy
 }
 
 func newStoredState() *storedState {
 	return &storedState{
-		versions: map[string]map[string]ComponentVersion{},
-		trains:   map[string]*Train{},
-		idem:     map[string]idemRecord{},
+		versions:   map[string]map[string]ComponentVersion{},
+		trains:     map[string]*Train{},
+		promotions: map[string]*Promotion{},
+		idem:       map[string]idemRecord{},
 	}
 }
 
@@ -49,6 +55,9 @@ func (s *storedState) clone() *storedState {
 	for id, t := range s.trains {
 		c.trains[id] = cloneTrain(t)
 	}
+	for id, p := range s.promotions {
+		c.promotions[id] = clonePromotion(p)
+	}
 	c.outbox = append(c.outbox, s.outbox...)
 	for k, v := range s.idem {
 		c.idem[k] = v
@@ -59,7 +68,22 @@ func (s *storedState) clone() *storedState {
 		p.Approvers = append([]Approver(nil), s.policy.Approvers...)
 		c.policy = &p
 	}
+	if s.promotionPolicy != nil {
+		c.promotionPolicy = clonePromotionPolicy(s.promotionPolicy)
+	}
 	return c
+}
+
+func clonePromotionPolicy(pol *PromotionPolicy) *PromotionPolicy {
+	cp := &PromotionPolicy{Environments: make([]EnvPolicy, len(pol.Environments))}
+	for i, e := range pol.Environments {
+		cp.Environments[i] = EnvPolicy{
+			Name:      e.Name,
+			Rules:     append([]ApprovalRule(nil), e.Rules...),
+			Approvers: append([]Approver(nil), e.Approvers...),
+		}
+	}
+	return cp
 }
 
 func cloneVersionRecord(v ComponentVersion) ComponentVersion {
@@ -242,11 +266,13 @@ func fromWire(w *trainWire) *Train {
 }
 
 type stateFile struct {
-	Versions    map[string]map[string]ComponentVersion `json:"versions"`
-	Trains      map[string]*trainWire                  `json:"trains"`
-	Outbox      []OutboxEvent                          `json:"outbox"`
-	Idempotency map[string]idemRecord                  `json:"idempotency"`
-	Policy      *PolicySnapshot                        `json:"policy,omitempty"`
+	Versions        map[string]map[string]ComponentVersion `json:"versions"`
+	Trains          map[string]*trainWire                  `json:"trains"`
+	Promotions      map[string]*promotionWire              `json:"promotions,omitempty"`
+	Outbox          []OutboxEvent                          `json:"outbox"`
+	Idempotency     map[string]idemRecord                  `json:"idempotency"`
+	Policy          *PolicySnapshot                        `json:"policy,omitempty"`
+	PromotionPolicy *PromotionPolicy                       `json:"promotion_policy,omitempty"`
 }
 
 func fromState(s *storedState) stateFile {
@@ -254,12 +280,18 @@ func fromState(s *storedState) stateFile {
 	for id, t := range s.trains {
 		trains[id] = toWire(t)
 	}
+	promotions := make(map[string]*promotionWire, len(s.promotions))
+	for id, p := range s.promotions {
+		promotions[id] = toPromotionWire(p)
+	}
 	return stateFile{
-		Versions:    s.versions,
-		Trains:      trains,
-		Outbox:      s.outbox,
-		Idempotency: s.idem,
-		Policy:      s.policy,
+		Versions:        s.versions,
+		Trains:          trains,
+		Promotions:      promotions,
+		Outbox:          s.outbox,
+		Idempotency:     s.idem,
+		Policy:          s.policy,
+		PromotionPolicy: s.promotionPolicy,
 	}
 }
 
@@ -272,9 +304,13 @@ func (f stateFile) toState() *storedState {
 		s.idem = f.Idempotency
 	}
 	s.policy = f.Policy
+	s.promotionPolicy = f.PromotionPolicy
 	s.outbox = f.Outbox
 	for id, w := range f.Trains {
 		s.trains[id] = fromWire(w)
+	}
+	for id, w := range f.Promotions {
+		s.promotions[id] = fromPromotionWire(w)
 	}
 	return s
 }
