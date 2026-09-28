@@ -1,8 +1,18 @@
 # go-release-train
 
-发布列车（Release Train）服务：管理组件版本登记、组件间版本约束、候选列车的编辑/冻结/审批/取消/放行全生命周期，保证冻结快照内依赖始终一致。
+发布列车（Release Train）服务：管理组件版本登记、组件间版本约束、候选列车的编辑/冻结/审批/取消/放行全生命周期，保证冻结快照内依赖始终一致；并在**已放行列车**之上提供跨环境（开发 → 预发布 → 生产）逐级晋级、审批门槛、失败回退与可重试的新尝试。
 
 开发环境：Go 1.23.0，无第三方依赖。
+
+## 环境晋级与列车放行的关系
+
+“放行（release）”和“环境晋级（environment promotion）”是两个先后衔接、各自完整的阶段：
+
+- **放行回答“这列车的内容对不对”**：冻结快照通过依赖校验、审批齐备后置为 `released`，写出一条 `train.released`。放行**不**代表它已经部署到任何环境。
+- **环境晋级回答“这列已放行的车如何逐环境落地”**：只有 `released` 列车才能创建晋级活动；活动在创建时刻再次**冻结**三样东西——列车快照、环境严格顺序、各环境审批门槛。未放行列车、或快照中版本在登记库中已不完整时，晋级活动不能开始。
+- 放行只做一次；晋级活动每列车也只创建一次。一次晋级活动内可有**多次尝试（attempt）**：某环境部署失败并回退完成后，问题修复可创建新尝试，新尝试**继续使用同一列车快照**，已经处于快照版本的环境直接继承、不重复部署、不重复写 outbox。
+- 已放行列车的冻结快照不可变，因此后续策略（列车审批策略、环境定义）的修改都不会影响在途的放行与晋级。
+
 
 ## 核心模型与不变量
 
@@ -118,10 +128,95 @@ PUT /components/payment/versions/1.2.0
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/outbox` | 列出未派发事件（每列车至多一条 `train.released`） |
+| GET | `/outbox` | 列出未派发事件（每列车至多一条 `train.released`；每个环境至多一条 `environment.promoted`） |
 | POST | `/outbox/{id}/dispatch` | 标记事件已派发 |
 
-事件 payload 包含 `train_id`、`snapshot_id` 与冻结快照的组件版本表。
+事件 payload 包含 `train_id`、`snapshot_id` 与冻结快照的组件版本表；`environment.promoted` 还包含 `promotion_id`、`attempt_no`、`environment`。
+
+## 跨环境晋级
+
+### 严格顺序与审批门槛
+
+环境默认严格顺序为 `dev → staging → production`，可用 `PUT /environment-policy` 整体替换（环境名即顺序，每个环境各自一份角色规则 + 有资格人员名单；规则为空表示该环境免审批）。环境定义与列车审批策略一样，在**创建晋级活动时复制为快照**，之后修改不影响在途活动。
+
+每个环境的部署领取（claim）同时受两个条件约束：
+
+1. 该环境的审批门槛已满足（角色人数齐备；同一 `(person, role)` 审批幂等）；
+2. 严格顺序上前一环境已 `promoted`。
+
+两者任一不满足都无法领取，因此回执也不可能越过尚未完成的前一环境。
+
+### 完整列车为单位 + 失败回退
+
+- 工作者领取部署时拿到 **租约号（lease_no）+ 尝试号（attempt_no）** 作为 fencing token，以及整列车快照目标和“部署前版本表”。
+- 必须以**完整列车**为单位提交回执：快照内每个组件都有回执后才收尾。**全部成功**才把环境记为 `promoted`，原子更新现网版本并写出且只写一条 `environment.promoted` 事件。
+- 任一组件失败：如实记录每个组件的实际结果（成功/失败、版本、消息），**绝不把混合版本当成功**，立即进入回退——为每个已更新（成功）的组件生成回退单元，恢复目标是首次领取时冻结的“部署前版本”（此前不存在则回退为下线）。回退单元逐个领取/回报，失败的单元可被再次领取重试；全部回退成功后本次尝试落为 `failed`。
+
+### 租约 fencing 与并发
+
+- 同一工作者重复领取其活动租约返回原租约；其他工作者领取视为**接管**：`lease_no` 单调 +1，旧租约的回执一律拒绝（不能覆盖接管后的状态），接管按整列车重新部署。
+- 回执必须携带当前 `attempt_no` 与 `lease_no`：旧尝试、被接管的旧租约都返回状态冲突。
+- 取消与审批/回执并发：若已有组件更新，取消进入 `cancel_requested` 并触发回退，回退完成才 `cancelled`，不遗留混合版本、不记成功；若无在途更新则立即 `cancelled`。重复取消幂等；`succeeded` 后取消报冲突。
+- 部署成功、回退、取消均与现网版本表、outbox 在同一事务内落盘。
+
+### 尝试（attempt）
+
+```
+创建活动(尝试1 running)
+  env: waiting_approval ──审批齐/前序done──▶ ready ──claim──▶ deploying
+   deploying ──全部组件成功──▶ promoted（写 1 条 environment.promoted）
+   deploying ──任一组件失败──▶ rolling_back ──回退完成──▶ failed
+                                                            │ 修复后
+                                                            ▼
+                                                    创建尝试2（沿用同一快照，
+                                                    已在快照版本的环境继承）
+  所有环境 promoted ──▶ succeeded（终态）
+  取消（有在途更新先回退）──▶ cancel_requested ──▶ cancelled（终态）
+```
+
+### 环境晋级接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| PUT | `/environment-policy` | 设置环境顺序与各环境门槛（只影响之后创建的活动） |
+| GET | `/environment-policy` | 查询当前环境定义 |
+| POST | `/trains/{id}/promotions` | 在已放行列车上创建晋级活动（冻结快照/顺序/门槛，可带 `request_id`） |
+| GET | `/promotions` | 列出全部晋级活动 |
+| GET | `/promotions/{id}` | 详情视图（见下） |
+| POST | `/promotions/{id}/approve` | 环境审批 `{"environment","person","role"}` |
+| POST | `/promotions/{id}/cancel` | 取消（有在途更新则回退，可带 `request_id`） |
+| POST | `/promotions/{id}/attempts` | 最近尝试失败回退后创建新尝试（沿用原快照，可带 `request_id`） |
+| POST | `/promotions/{id}/environments/{env}/claim` | 领取部署 `{"worker":"w1"}`，返回 `attempt_no/lease_no/targets/before` |
+| POST | `/promotions/{id}/environments/{env}/receipts` | 提交组件回执（带 `attempt_no`、`lease_no`、`receipts[]`，可带 `request_id`） |
+| POST | `/promotions/{id}/rollback/claim` | 领取下一个待回退单元 |
+| POST | `/promotions/{id}/rollback/report` | 回报回退单元结果 `{"attempt_no","lease_no","environment","component","success"}` |
+
+`GET /promotions/{id}` 每次尝试、每个环境返回：执行前版本（`before_versions`，空串表示此前无该组件）、目标版本（`target_versions`，即列车快照）、现网实际版本（`current_versions`）、各组件部署回执（`results`）、回退单元进度（`rollback`）、审批门槛与已获审批及缺口（`approval_policy/approvals/missing_approvals`）、当前租约（`lease`）、晋级时间与事件 ID，以及当前不能继续的原因（`blocking_reason`：审批未齐 / 等待前一环境 / 回退中 / 等待新尝试等）。
+
+### 环境晋级快速试用
+
+```bash
+# 前置：版本登记、装候选、冻结、审批、放行（见“快速试用”），得到已放行列车 $TID
+PID=$(curl -sXPOST localhost:8080/trains/$TID/promotions -d '{}' | jq -r .id)
+
+# 1. 领取 dev 部署（默认环境免审批），得到 attempt_no / lease_no
+curl -sXPOST localhost:8080/promotions/$PID/environments/dev/claim -d '{"worker":"w1"}'
+
+# 2. 提交整列车回执（全部成功 → promoted，写一条 environment.promoted）
+curl -sXPOST localhost:8080/promotions/$PID/environments/dev/receipts -d '{
+  "attempt_no":1,"lease_no":1,
+  "receipts":[
+    {"component":"order","success":true},
+    {"component":"payment","success":true}
+  ]}'
+
+# 若有组件失败（success:false）→ 自动进入回退：
+#   POST /promotions/$PID/rollback/claim  领取单元
+#   POST /promotions/$PID/rollback/report 回报成功（恢复到部署前版本）
+# 全部回退完成后：
+curl -sXPOST localhost:8080/promotions/$PID/attempts -d '{}'   # 新尝试，沿用同一快照
+# 然后依次 staging、production 重复 claim + receipts
+```
 
 ## 快速试用
 
@@ -157,11 +252,13 @@ curl -s localhost:8080/outbox
 | `version.go` | 语义版本解析/比较，版本约束与满足判断 |
 | `model.go` | 组件版本、策略快照、审批、outbox 事件、列车聚合与状态机字段 |
 | `validation.go` | 快照依赖校验：约束满足 + Kahn 无环检测，问题一次性收集 |
-| `aggregate.go` | 聚合行为：编辑、冻结、审批、取消、放行 |
+| `aggregate.go` | 列车聚合行为：编辑、冻结、审批、取消、放行 |
+| `promotion.go` | 环境晋级聚合：环境顺序/门槛快照、尝试、部署租约与回执 fencing、回退、取消、新尝试 |
+| `promotion_service.go` | 晋级应用服务：事务编排、幂等键、outbox 唯一、现网版本表、查询视图与阻断原因 |
 | `errors.go` | 七类领域错误及 `DependencyError`（携带全部问题） |
-| `persistence.go` | 事务式 Store 接口、JSON 文件原子落盘、内存存储、序列化 |
+| `persistence.go` | 事务式 Store 接口、JSON 文件原子落盘、内存存储、列车与晋级活动序列化 |
 | `service.go` | 应用服务：事务编排、乐观版本条件、幂等键、全部用例与查询 |
-| `http.go` | JSON HTTP 接口与错误码映射 |
+| `http.go` / `http_promotion.go` | JSON HTTP 接口与错误码映射（含全部晋级端点） |
 | `cmd/release-train/main.go` | 服务入口 |
 
 ## 测试
@@ -183,3 +280,18 @@ go test -race ./...
 - 版本不可变冲突、request id 重放与冲突；
 - 文件持久化重启恢复（快照/策略/审批/outbox/不可变性）；
 - HTTP 全流程、422 problems、409 版本冲突、404/400。
+
+环境晋级：
+
+- 创建门槛：仅 `released` 可晋级、快照依赖不完整被拒（422 problems）、一列车一次活动；
+- 环境顺序/门槛快照冻结，创建后改定义不影响在途活动；审批资格与幂等、未齐/越序领取被拒；
+- 完整列车部署：全部成功才 promoted 且每环境一条稳定 outbox；
+- 部分组件失败如实记录结果、不把混合版本当成功，按“部署前版本”回退已更新组件（失败单元可重试）；
+- 回退完成后新尝试沿用同一快照；已晋级环境继承、不重复部署/出事件；
+- 租约/尝试号 fencing：同工人重领不变号、接管租约 +1、旧租约与旧尝试回执被拒、旧结果不覆盖接管后状态；
+- 并发 10 路领取租约号单调、仅最高租约可提交；
+- 回执幂等（分批、request_id 重试、晋级后重放）且 outbox 不重复；
+- 取消并发：有在途更新先 `cancel_requested` 回退再 `cancelled`、无更新立即取消、成功后取消冲突、重复取消幂等；
+- 查询视图：执行前后/目标版本、组件结果、回退进度、审批依据与缺口、当前阻断原因；
+- 晋级活动重启恢复后可继续回退且旧租约仍被 fencing；
+- HTTP 全流程（门槛/越序 409、无资格 403、失败回退新尝试、outbox 计数、404/400）。

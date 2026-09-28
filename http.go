@@ -48,6 +48,20 @@ func (h *Handler) routes() {
 	m.HandleFunc("POST /trains/{id}/approve", h.approve)
 	m.HandleFunc("POST /trains/{id}/cancel", h.cancel)
 	m.HandleFunc("POST /trains/{id}/release", h.release)
+	m.HandleFunc("POST /trains/{id}/promotions", h.createPromotion)
+
+	m.HandleFunc("PUT /environment-policy", h.putEnvironmentPolicy)
+	m.HandleFunc("GET /environment-policy", h.getEnvironmentPolicy)
+
+	m.HandleFunc("GET /promotions", h.listPromotions)
+	m.HandleFunc("GET /promotions/{id}", h.getPromotion)
+	m.HandleFunc("POST /promotions/{id}/approve", h.promotionApprove)
+	m.HandleFunc("POST /promotions/{id}/cancel", h.cancelPromotion)
+	m.HandleFunc("POST /promotions/{id}/attempts", h.newAttempt)
+	m.HandleFunc("POST /promotions/{id}/environments/{env}/claim", h.claimDeployment)
+	m.HandleFunc("POST /promotions/{id}/environments/{env}/receipts", h.submitReceipts)
+	m.HandleFunc("POST /promotions/{id}/rollback/claim", h.claimRollback)
+	m.HandleFunc("POST /promotions/{id}/rollback/report", h.reportRollback)
 
 	m.HandleFunc("GET /outbox", h.listOutbox)
 	m.HandleFunc("POST /outbox/{id}/dispatch", h.dispatchOutbox)
